@@ -37,7 +37,7 @@ from pkg_resources import get_distribution, DistributionNotFound
 from tabulate import tabulate
 
 from packit.actions import ActionName
-from packit.config import Config
+from packit.config import Config, SyncFilesConfig
 from packit.config.common_package_config import CommonPackageConfig
 from packit.config.package_config import find_packit_yaml, load_packit_yaml
 from packit.config.package_config_validator import PackageConfigValidator
@@ -53,6 +53,7 @@ from packit.exceptions import (
     PackitCoprException,
 )
 from packit.local_project import LocalProject
+from packit.patches import PatchGenerator
 from packit.source_git import SourceGitGenerator
 from packit.status import Status
 from packit.sync import RawSyncFilesItem, sync_files
@@ -262,6 +263,9 @@ class PackitAPI:
                         upstream=upstream_ref,
                         destination=str(self.dg.absolute_specfile_dir),
                     )
+                    patches = PatchGenerator.undo_identical(
+                        patches, self.dg.local_project.git_repo
+                    )
                     self.dg.specfile_add_patches(patches)
                 self._handle_sources(
                     add_new_sources=True, force_new_sources=force_new_sources
@@ -330,6 +334,7 @@ class PackitAPI:
         remote_name: str = None,
         exclude_files: Iterable[str] = None,
         force: bool = False,
+        sync_only_specfile: bool = False,
     ):
         """
         Sync content of Fedora dist-git repo back to upstream
@@ -341,6 +346,7 @@ class PackitAPI:
         :param remote_name: name of remote where we should push; if None, try to find a ssh_url
         :param exclude_files: files that will be excluded from the sync
         :param force: ignore changes in the git index
+        :param sync_only_specfile: whether to sync only content of specfile
         """
         exclude_files = exclude_files or []
         if not dist_git_branch:
@@ -367,7 +373,13 @@ class PackitAPI:
             self.up.create_branch(local_pr_branch)
             self.up.checkout_branch(local_pr_branch)
 
-        raw_sync_files = self.package_config.synced_files.get_raw_files_to_sync(
+        files = (
+            SyncFilesConfig([self.package_config.get_specfile_sync_files_item()])
+            if sync_only_specfile
+            else self.package_config.synced_files
+        )
+
+        raw_sync_files = files.get_raw_files_to_sync(
             dest_dir=self.dg.local_project.working_dir,
             src_dir=self.up.local_project.working_dir,
         )
@@ -520,7 +532,7 @@ class PackitAPI:
             self.up.prepare_upstream_for_srpm_creation(upstream_ref=upstream_ref)
         except Exception as ex:
             raise PackitSRPMException(
-                f"Preparing of the upstream to the SRPM build failed: {ex}"
+                f"Preparation of the repository for creation of an SRPM failed: {ex}"
             ) from ex
         try:
             srpm_path = self.up.create_srpm(srpm_path=output_file, srpm_dir=srpm_dir)

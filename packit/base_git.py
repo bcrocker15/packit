@@ -20,18 +20,12 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 import shlex
-import urllib
 from logging import getLogger
 from pathlib import Path
 from typing import Optional, Callable, List, Iterable, Dict
 
 import git
 from git import PushInfo
-
-from rebasehelper.exceptions import (
-    DownloadError,
-    RebaseHelperError,
-)
 from rebasehelper.helpers.download_helper import DownloadHelper
 
 from packit.actions import ActionName
@@ -133,27 +127,10 @@ class PackitRepositoryBase:
                (exc will be raised if the branch is not in the remote)
         :return the branch which was just created
         """
-        # it's not an error if the branch already exists
-        if branch_name in self.local_project.git_repo.branches:
-            logger.debug(
-                f"It seems that branch {branch_name!r} already exists, checking it out."
-            )
-            head = self.local_project.git_repo.branches[branch_name]
-        else:
-            head = self.local_project.git_repo.create_head(branch_name, commit=base)
-
-        if setup_tracking:
-            origin = self.local_project.git_repo.remote("origin")
-            if branch_name in origin.refs:
-                remote_ref = origin.refs[branch_name]
-            else:
-                raise PackitException(
-                    f"Remote origin doesn't have ref {branch_name!r}."
-                )
-            # this is important to fedpkg: build can't find the tracking branch otherwise
-            head.set_tracking_branch(remote_ref)
-
-        return head
+        # keeping the method in this class to preserve compatibility
+        return self.local_project.create_branch(
+            branch_name=branch_name, base=base, setup_tracking=setup_tracking
+        )
 
     def checkout_branch(self, git_ref: str = None):
         """
@@ -431,43 +408,11 @@ class PackitRepositoryBase:
         the configuration match to the URL basename from SourceX) or from the one
         from SourceX in specfile.
         """
-        # filter out only sources with URL
-        remote_files = [
-            source
-            for source in self.specfile.sources
-            if bool(urllib.parse.urlparse(source).scheme)
-        ]
-
-        # download any sources that are not yet downloaded
-        for remote_file in remote_files:
-            basename = Path(remote_file).name
-            local_file = Path(self.specfile.sources_location).joinpath(basename)
-            if not Path(local_file).is_file():
-                logger.info(f"File {local_file} doesn't exist locally, downloading it.")
-                url = self.get_matching_source_url_from_config(basename) or remote_file
-                logger.info(f"Downloading file from URL {url}. ")
-                try:
-                    DownloadHelper.download_file(url, str(local_file))
-                except DownloadError as e:
-                    raise RebaseHelperError(
-                        f"Failed to download file from URL {url}. Reason: {e}. "
-                    ) from e
-
-    def get_matching_source_url_from_config(self, source_file) -> Optional[str]:
-        """
-        Try to find a source item in the config with the same name as source_file
-        and return its URL.
-        :param source_file: source file to find in the config
-        :return: URL
-        """
-        matching = [
-            source.url
-            for source in self.package_config.sources
-            if source.path == source_file
-        ]
-        if matching:
-            logger.debug(
-                f"Found matching URL for {source_file} in the configuration: {matching}."
+        # Fetch all sources defined in packit.yaml -> sources
+        for source in self.package_config.sources:
+            logger.info(f"Downloading source {source.path!r}.")
+            DownloadHelper.download_file(
+                source.url,
+                str(Path(self.specfile.sources_location).joinpath(source.path)),
             )
-            return matching[0]
-        return None
+        self.specfile.download_remote_sources()

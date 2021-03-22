@@ -1,43 +1,25 @@
-# MIT License
-#
-# Copyright (c) 2020 Red Hat, Inc.
-
-# Permission is hereby granted, free of charge, to any person obtaining a copy
-# of this software and associated documentation files (the "Software"), to deal
-# in the Software without restriction, including without limitation the rights
-# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-# copies of the Software, and to permit persons to whom the Software is
-# furnished to do so, subject to the following conditions:
-#
-# The above copyright notice and this permission notice shall be included in all
-# copies or substantial portions of the Software.
-#
-# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-# SOFTWARE.
+# Copyright Contributors to the Packit project.
+# SPDX-License-Identifier: MIT
 
 """
 Processing RPM spec file patches.
 """
 import datetime
 import logging
+import tempfile
 from itertools import islice
 from pathlib import Path
 from typing import List, Optional, Dict
 
 import git
 import yaml
-from packit.exceptions import PackitException
 
 from packit.constants import DATETIME_FORMAT
+from packit.exceptions import PackitException, PackitGitException
 from packit.git_utils import get_metadata_from_message
 from packit.local_project import LocalProject
 from packit.utils.commands import run_command
-from packit.utils.repo import is_a_git_ref
+from packit.utils.repo import is_a_git_ref, git_patch_ish
 
 logger = logging.getLogger(__name__)
 
@@ -221,10 +203,11 @@ class PatchGenerator:
         logger.debug(f"All commits are contained on top of {git_ref!r}.")
         return True
 
-    @staticmethod
-    def linearize_history(git_ref: str):
+    def linearize_history(self, git_ref: str) -> str:
         r"""
         Transform complex git history into a linear one starting from a selected git ref.
+
+        Returns the name of the linearized branch.
 
         Change this:
         * | | | | | | | |   ea500ac513 (tag: v245) Merge pull request #15...
@@ -244,10 +227,18 @@ class PatchGenerator:
             "Therefore we are going to make the history linear on a dedicated branch \n"
             "to make sure the patches will be able to be applied."
         )
+        if self.lp.git_repo.is_dirty():
+            raise PackitGitException(
+                "The source-git repo is dirty which means we won't be able to do a linear history. "
+                "Please commit the changes to resolve the issue. If you are changing the content "
+                "of the repository in an action, you can commit those as well."
+            )
         current_time = datetime.datetime.now().strftime(DATETIME_FORMAT)
+        initial_branch = self.lp.ref
         target_branch = f"packit-patches-{current_time}"
         logger.info(f"Switch branch to {target_branch!r}.")
-        run_command(["git", "checkout", "-B", target_branch])
+        ref = self.lp.create_branch(target_branch)
+        ref.checkout()
         target = f"{git_ref}..HEAD"
         logger.debug(f"Linearize history {target}.")
         # https://stackoverflow.com/a/17994534/909579
@@ -258,19 +249,28 @@ class PatchGenerator:
         #   ` -p 61f3e897f13101f29fb8027e8839498a469ad58e`
         #   ` -p b7cf4b4ef5d0336443f21809b1506bc4a8aa75a9 -p 257188f80ce1a083e3a88b679b898a7...`
         # so we will keep the first parent and drop all the others
-        run_command(
-            [
-                "git",
-                "filter-branch",
-                "-f",
-                "--parent-filter",
-                'cut -f 2,3 -d " "',
-                target,
-            ],
-            # git prints nasty warning when filter-branch is used that it's dangerous
-            # this env var prevents it from prints
-            env={"FILTER_BRANCH_SQUELCH_WARNING": "1"},
-        )
+        try:
+            run_command(
+                [
+                    "git",
+                    "filter-branch",
+                    "-f",
+                    "--parent-filter",
+                    'cut -f 2,3 -d " "',
+                    target,
+                ],
+                # git prints nasty warning when filter-branch is used that it's dangerous
+                # this env var prevents it from printing
+                env={"FILTER_BRANCH_SQUELCH_WARNING": "1"},
+                print_live=True,
+                cwd=self.lp.working_dir,
+            )
+        finally:
+            # check out the former branch
+            self.lp.checkout_ref(initial_branch)
+            # we could also delete the newly created branch,
+            # but let's not do that so that user can inspect it
+        return target_branch
 
     def run_git_format_patch(
         self,
@@ -315,7 +315,7 @@ class PatchGenerator:
         commits: List[git.Commit],
         destination: str,
         files_to_ignore: List[str] = None,
-    ):
+    ) -> List[PatchMetadata]:
         """
         Pair commits (in a source-git repo) with a list patches generated with git-format-patch.
 
@@ -391,7 +391,7 @@ class PatchGenerator:
     @staticmethod
     def process_git_am_style_patches(
         patch_list: List[PatchMetadata],
-    ):
+    ) -> List[PatchMetadata]:
         """
         When using `%autosetup -S git_am`, there is a case
         where a single patch file contains multiple commits.
@@ -456,6 +456,51 @@ class PatchGenerator:
 
         return new_patch_list
 
+    @staticmethod
+    def undo_identical(
+        patch_list: List[PatchMetadata],
+        repo: git.Repo,
+    ) -> List[PatchMetadata]:
+        """
+        Remove from patch_list and undo changes of patch files which
+        have the same patch-id as their previous version, and so they
+        can be considerd identical.
+
+        :param patch_list: List of patches to check.
+        :param repo: Git repo to work in.
+        :return: A filtered list of patches, with identical patches removed.
+        """
+        ret: List[PatchMetadata] = []
+        for patch in patch_list:
+            relative_patch_path = patch.path.relative_to(repo.working_dir)
+            logger.debug(f"Processing {relative_patch_path} ...")
+            new_patch = str(relative_patch_path) in repo.untracked_files
+            if new_patch:
+                logger.debug(f"{relative_patch_path} is a new patch")
+                ret.append(patch)
+                continue
+
+            # patch-id before the change
+            prev_patch = repo.git.show(f"HEAD:{relative_patch_path}")
+            prev_patch = git_patch_ish(prev_patch)
+            with tempfile.TemporaryFile(mode="w+") as fp:
+                fp.write(prev_patch)
+                fp.seek(0)
+                prev_patch_id = repo.git.patch_id("--stable", istream=fp).split()[0]
+                logger.debug(f"Previous patch-id: {prev_patch_id}")
+
+            # current patch-id
+            with open(patch.path, "r") as fp:
+                current_patch_id = repo.git.patch_id("--stable", istream=fp).split()[0]
+                logger.debug(f"Current patch-id: {current_patch_id}")
+
+            if current_patch_id != prev_patch_id:
+                ret.append(patch)
+            else:
+                # this looks the same, don't change it
+                repo.git.checkout("--", relative_patch_path)
+        return ret
+
     def create_patches(
         self,
         git_ref: str,
@@ -471,41 +516,34 @@ class PatchGenerator:
         :return: [PatchMetadata, ...] list of patches
         """
         files_to_ignore = files_to_ignore or []
-        contained = self.are_child_commits_contained(git_ref)
-        if not contained:
-            self.linearize_history(git_ref)
-
         patch_list: List[PatchMetadata] = []
+        contained = self.are_child_commits_contained(git_ref)
+        patches_revision_range = f"{git_ref}..HEAD"
+        if not contained:
+            lin_branch = self.linearize_history(git_ref)
+            # we're still on the same branch but want to get patches from the linearized branch
+            patches_revision_range = f"{git_ref}..{lin_branch}"
 
-        try:
-            commits = self.get_commits_since_ref(
-                git_ref, add_upstream_head_commit=False
+        # this is a string, separated by new-lines, with the names of patch files
+        git_format_patch_out = self.run_git_format_patch(
+            destination, files_to_ignore, patches_revision_range
+        )
+
+        if git_format_patch_out:
+            patches: Dict[str, bytes] = {
+                # we need to read bytes since we cannot decode whatever is inside patches
+                patch_name: Path(patch_name).read_bytes()
+                for patch_name in git_format_patch_out.split("\n")
+            }
+            commits = self.get_commits_in_range(patches_revision_range)
+            patch_list = self.process_patches(
+                patches, commits, destination, files_to_ignore
             )
-            # this is a string, separated by new-lines, with the names of patch files
-            git_format_patch_out = self.run_git_format_patch(
-                destination, files_to_ignore, git_ref
-            )
+            patch_list = self.process_git_am_style_patches(patch_list)
+        else:
+            logger.info(f"No patches in range {patches_revision_range}")
 
-            if git_format_patch_out:
-                patches: Dict[str, bytes] = {
-                    # we need to read bytes since we cannot decode whatever is inside patches
-                    patch_name: Path(patch_name).read_bytes()
-                    for patch_name in git_format_patch_out.split("\n")
-                }
-                patch_list = self.process_patches(
-                    patches, commits, destination, files_to_ignore
-                )
-                patch_list = self.process_git_am_style_patches(patch_list)
-            else:
-                logger.info(f"No patches between {git_ref!r} and {self.lp.ref!r}")
-
-            return patch_list
-        finally:
-            if not contained:
-                # check out the previous branch
-                run_command(["git", "checkout", "-", "--"])
-                # we could also delete the newly created branch,
-                # but let's not do that so that user can inspect it
+        return patch_list
 
     def get_commits_since_ref(
         self,
@@ -519,7 +557,7 @@ class PatchGenerator:
         :param git_ref: get commits since this git ref
         :param add_upstream_head_commit: add also upstream rev/tag commit as a first value
         :param no_merge_commits: do not include merge commits in the list if True
-        :return: list of commits (last commit on the current branch.).
+        :return: list of commits (last commit on the current branch)
         """
         if is_a_git_ref(repo=self.lp.git_repo, ref=git_ref):
             upstream_ref = git_ref
@@ -527,18 +565,32 @@ class PatchGenerator:
             upstream_ref = f"origin/{git_ref}"
             if upstream_ref not in self.lp.git_repo.refs:
                 raise PackitException(
-                    f"Upstream {upstream_ref!r} branch nor {git_ref!r} tag not found."
+                    f"Couldn't not find upstream branch {upstream_ref!r} and tag {git_ref!r}."
                 )
-
-        commits = list(
-            self.lp.git_repo.iter_commits(
-                rev=f"{git_ref}..{self.lp.ref}",
-                reverse=True,
-                no_merges=no_merge_commits,  # do not include merge commits in the list
-            )
+        commits = self.get_commits_in_range(
+            revision_range=f"{git_ref}..{self.lp.ref}",
+            no_merge_commits=no_merge_commits,
         )
         if add_upstream_head_commit:
             commits.insert(0, self.lp.git_repo.commit(upstream_ref))
 
         logger.debug(f"Delta ({upstream_ref}..{self.lp.ref}): {len(commits)}")
         return commits
+
+    def get_commits_in_range(
+        self, revision_range: str, no_merge_commits: bool = True
+    ) -> List[git.Commit]:
+        """
+        provide a list of git.Commit objects in a given git range
+
+        :param revision_range: e.g. `branch..HEAD`, see `man git-log` for more info
+        :param no_merge_commits: don't include merge commits in the list
+        :return: list of commits (last commit on the current branch)
+        """
+        return list(
+            self.lp.git_repo.iter_commits(
+                rev=revision_range,
+                reverse=True,
+                no_merges=no_merge_commits,  # do not include merge commits in the list
+            )
+        )

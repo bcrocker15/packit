@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from packit.exceptions import PackitException
+from packit.patches import PatchGenerator
 from packit.specfile import Specfile
 from packit.utils.commands import cwd
 from tests.integration.conftest import mock_spec_download_remote_s
@@ -43,7 +45,6 @@ from tests.spellbook import (
 def test_basic_local_update_without_patching(
     sourcegit_and_remote,
     distgit_and_remote,
-    mock_patching,
     mock_remote_functionality_sourcegit,
     api_instance_source_git,
 ):
@@ -131,11 +132,14 @@ def test_basic_local_update_patch_content(
 +Version:        0.1.0"""
         in git_diff
     )
-
-    # make sure the patches are placed after Source0
-    patches = """\
+    # Make sure the patches are placed after Source0, but outside %if %endif
+    patches = (
+        """\
 Source0:        %{upstream_name}-%{version}.tar.gz
-+
+ %endif
+ BuildArch:      noarch
+ """  # because linters would remove the trailing whitespace
+        + """
 +# switching to amarillo hops
 +# Author: Packit Test Suite <test@example.com>
 +Patch0001: 0001-switching-to-amarillo-hops.patch
@@ -148,8 +152,8 @@ Source0:        %{upstream_name}-%{version}.tar.gz
 +# Author: Packit Test Suite <test@example.com>
 +Patch0003: 0003-source-change.patch
 +
-+
 """
+    )
     assert patches in git_diff
 
     assert "Patch0004:" not in git_diff
@@ -311,7 +315,6 @@ def test_basic_local_update_patch_content_with_metadata(
 +# Few words for info.
 +Patch0003: testing.patch
 +
-+
 """
     assert patches in git_diff
 
@@ -360,7 +363,6 @@ def test_basic_local_update_patch_content_with_metadata_and_patch_ignored(
 +# Author: Packit Test Suite <test@example.com>
 +Patch0002: 0002-actually-let-s-do-citra.patch
 +
-+
 """
     assert patches in git_diff
 
@@ -402,7 +404,6 @@ def test_basic_local_update_patch_content_with_downstream_patch(
 +# Author: Packit Test Suite <test@example.com>
 +Patch0002: 0002-actually-let-s-do-citra.patch
 +
-+
 """
     assert patches in git_diff
 
@@ -438,6 +439,12 @@ def test_srpm_merge_storm(
     sg_path = Path(api_instance_source_git.upstream_local_project.working_dir)
     mock_spec_download_remote_s(sg_path, sg_path / "fedora", "0.1.0")
     create_merge_commit_in_source_git(sg_path, go_nuts=True)
+
+    # linearization creates a new branch, make some arbitrary moves to verify
+    # we end up in the former branch after the build
+    subprocess.check_call(["git", "checkout", "-B", "test-branch"], cwd=sg_path)
+    subprocess.check_call(["git", "checkout", "main"], cwd=sg_path)
+
     with cwd(sg_path):
         api_instance_source_git.create_srpm(upstream_ref=ref)
     srpm_path = list(sg_path.glob("beer-0.1.0-2.*.src.rpm"))[0]
@@ -453,9 +460,44 @@ def test_srpm_merge_storm(
         raise AssertionError(
             "packit-patches- branch was not found - this should trigger the linearization"
         )
+    # make sure we are on the main branch
+    assert (
+        "main"
+        == subprocess.check_output(["git", "branch", "--show-current"], cwd=sg_path)
+        .decode()
+        .strip()
+    )
     assert {x.name for x in sg_path.joinpath("fedora").glob("*.patch")} == {
         "0001-MERGE-COMMIT.patch",
         "0002-ugly-merge-commit.patch",
+    }
+
+
+def test_srpm_merge_storm_dirty(api_instance_source_git):
+    """ verify the linearization is halted when a source-git repo si dirty """
+    ref = "0.1.0"
+    sg_path = Path(api_instance_source_git.upstream_local_project.working_dir)
+    mock_spec_download_remote_s(sg_path, sg_path / "fedora", ref)
+    create_merge_commit_in_source_git(sg_path, go_nuts=True)
+    (sg_path / "malt").write_text("Mordor\n")
+    with pytest.raises(PackitException) as ex:
+        with cwd("/"):  # let's mimic p-s by having different cwd than the project
+            api_instance_source_git.create_srpm(upstream_ref=ref)
+    assert "The source-git repo is dirty" in str(ex.value)
+
+
+def test_linearization(api_instance_source_git):
+    ref = "0.1.0"
+    sg_path = Path(api_instance_source_git.upstream_local_project.working_dir)
+    mock_spec_download_remote_s(sg_path, sg_path / "fedora", ref)
+    create_merge_commit_in_source_git(sg_path, go_nuts=True)
+    with cwd("/"):  # let's mimic p-s by having different cwd than the project
+        pg = PatchGenerator(api_instance_source_git.upstream_local_project)
+        pg.create_patches(ref, sg_path / "fedora")
+    assert {x.name for x in sg_path.joinpath("fedora").glob("*.patch")} == {
+        "0001-sourcegit-content.patch",
+        "0002-MERGE-COMMIT.patch",
+        "0003-ugly-merge-commit.patch",
     }
 
 
